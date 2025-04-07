@@ -1,0 +1,38 @@
+// src/middleware/sessionMiddleware.js
+import connectDB from '../db/index.js';
+import jwt from 'jsonwebtoken';
+
+export const validateSession = async (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    const deviceId = req.headers['x-device-id'];
+
+    if (!token || !deviceId) {
+        return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        
+        // Verify device ID matches the one in token
+        if (decoded.deviceId !== deviceId) {
+            return res.status(401).json({ message: 'Invalid session' });
+        }
+
+        const connection = await connectDB();
+        
+        // Check if session is active
+        const [session] = await connection.query(
+            'SELECT * FROM login_history WHERE user_id = ? AND device_id = ? AND is_active = true AND logout_time IS NULL',
+            [decoded.userId, deviceId]
+        );
+
+        if (session.length === 0) {
+            return res.status(401).json({ message: 'Session expired' });
+        }
+
+        req.user = decoded;
+        next();
+    } catch (error) {
+        return res.status(401).json({ message: 'Invalid token' });
+    }
+};

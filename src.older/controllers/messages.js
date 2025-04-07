@@ -1,0 +1,433 @@
+// src/controllers/messages.js
+
+import connectDB from '../db/index.js';
+import fs from 'fs';
+import path from 'path';
+import { logger } from '../logger.js';
+
+// Function to format the scheduled time
+const formatScheduledAt = (scheduledAt) => {
+    if (!scheduledAt) return null;
+
+    const date = new Date(scheduledAt);
+    if (isNaN(date.getTime())) {
+        logger.error('Invalid date provided:', scheduledAt);
+        return null;
+    }
+
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+
+    return `${year}-${month}-${day}T${hours}:${minutes}`;
+};
+
+// Function to save messaging data to the database
+export const logMediaMessageToDB = async (instanceId, phoneNumbers, message, media, caption, scheduleTime, messageStatus) => {
+    try {
+        const connection = await connectDB();
+
+        // Define valid ENUM values for message_status
+        const validMessageStatus = ['sent', 'delivered', 'read', 'failed'];
+        const messageStatusValidated = validMessageStatus.includes(messageStatus) ? messageStatus : 'sent';
+
+        const query = `
+            INSERT INTO media_messages 
+            (instance_id, recipient, message, media, caption, schedule_time, message_status, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, NOW());
+        `;
+
+        const values = [
+            instanceId || null,
+            Array.isArray(phoneNumbers) ? phoneNumbers.join(',') : '',
+            message || null,
+            media || null,
+            caption || null,
+            formatScheduledAt(scheduleTime),
+            messageStatusValidated
+        ];
+
+        logger.info('Logging to DB:', { values });
+        const [result] = await connection.execute(query, values);
+        logger.info('Message logged successfully:', { result });
+        return result.insertId;
+
+    } catch (error) {
+        logger.error('Failed to log message to DB:', { error: error.message, stack: error.stack });
+        throw error;
+    }
+};
+
+// Function to update message status
+export const updateMessageStatusInDB = async (messageId, newStatus) => {
+    try {
+        const connection = await connectDB();
+        const validMessageStatus = ['sent', 'delivered', 'read', 'failed'];
+        
+        if (!validMessageStatus.includes(newStatus)) {
+            throw new Error(`Invalid message status: ${newStatus}`);
+        }
+
+        const query = `UPDATE media_messages SET message_status = ? WHERE id = ?`;
+        const [result] = await connection.execute(query, [newStatus, messageId]);
+
+        if (result.affectedRows > 0) {
+            logger.info(`Message status updated successfully for message ID ${messageId} to ${newStatus}`);
+        } else {
+            logger.warn(`No rows updated for message ID ${messageId}. It may not exist.`);
+        }
+    } catch (error) {
+        logger.error('Failed to update message status in DB:', { error: error.message, stack: error.stack });
+        throw error;
+    }
+};
+
+// Function to send messages with random delays
+export const sendMessagesOneAtATime = async (numbers, mediaPayload, textMessage, sock, instanceId, filePath, caption, scheduleTime) => {
+    const getRandomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+    let totalMessagesSent = 0;
+    const totalNumbers = numbers.length;
+
+    // Check if WhatsApp is connected
+    if (!sock || !sock.user || !sock.user.id) {
+        logger.error('WhatsApp connection not ready');
+        throw new Error('WhatsApp connection not ready');
+    }
+
+    for (const number of numbers) {
+        const jid = `${number}@s.whatsapp.net`;
+
+        try {
+            let isMediaSent = false;
+            let isMessageSent = false;
+
+            // Send media with caption if mediaPayload exists
+            if (mediaPayload) {
+                logger.info(`Attempting to send media to ${number}`, { 
+                    fileType: mediaPayload.mimetype || 'document',
+                    fileName: mediaPayload.fileName || 'unknown'
+                });
+                
+                try {
+                    await sock.sendMessage(jid, {
+                        ...mediaPayload,
+                        quoted: null  // Ensure no quoted message reference
+                    });
+                    isMediaSent = true;
+                    logger.info(`Media sent successfully to ${number}`);
+                } catch (mediaError) {
+                    logger.error(`Failed to send media to ${number}:`, { 
+                        error: mediaError.message,
+                        stack: mediaError.stack 
+                    });
+                    throw mediaError;
+                }
+            }
+
+            // Send text message if it exists
+            if (textMessage) {
+                try {
+                    await sock.sendMessage(jid, { 
+                        text: textMessage,
+                        quoted: null  // Ensure no quoted message reference
+                    });
+                    isMessageSent = true;
+                    logger.info(`Text message sent successfully to ${number}`);
+                } catch (textError) {
+                    logger.error(`Failed to send text to ${number}:`, { 
+                        error: textError.message,
+                        stack: textError.stack 
+                    });
+                    throw textError;
+                }
+            }
+
+            // Log success
+            await logMediaMessageToDB(
+                instanceId,
+                [number],
+                isMessageSent ? textMessage : null,
+                isMediaSent ? filePath : null,
+                isMediaSent ? caption : null,
+                scheduleTime,
+                'sent'
+            );
+
+            totalMessagesSent++;
+            logger.info(`Progress: ${totalMessagesSent}/${totalNumbers} messages sent`);
+
+        } catch (err) {
+            logger.error(`Failed to send message to ${number}:`, { 
+                error: err.message,
+                stack: err.stack,
+                mediaPayload: mediaPayload ? {
+                    type: mediaPayload.mimetype || 'document',
+                    fileName: mediaPayload.fileName
+                } : null
+            });
+
+            // Log failure
+            await logMediaMessageToDB(
+                instanceId,
+                [number],
+                textMessage || null,
+                filePath || null,
+                caption || null,
+                scheduleTime,
+                'failed'
+            );
+        }
+
+        if (totalMessagesSent < totalNumbers) {
+            // Random delay between messages (2-6.5 seconds)
+            const delay = getRandomDelay(2000, 6500);
+            logger.info(`Waiting ${delay/1000} seconds before next message...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+
+    return totalMessagesSent;
+};
+
+
+// Handle media message sending
+export const sendMedia = async (req, res) => {
+    const { instanceId, sock } = req;
+    const { numbers, filePath, caption, message, scheduleTime } = req.body;
+
+    try {
+        // Validate required fields
+        if (!numbers || !Array.isArray(numbers) || numbers.length === 0) {
+            return res.status(400).json({ 
+                success: false,
+                message: 'Phone numbers are required and must be an array' 
+            });
+        }
+
+        // Get latest subscription details
+        const connection = await connectDB();
+        const [subscriptionDetails] = await connection.query(
+            'SELECT s.* FROM subscription s ' +
+            'WHERE s.instance_id = ? ' +
+            'AND s.date_expiry >= CURDATE() ' +  // Only get active subscription
+            'ORDER BY s.created_at DESC, s.id DESC ' +  // Order by created_at and id to get the newest
+            'LIMIT 1',
+            [instanceId]
+        );
+
+        if (!subscriptionDetails || subscriptionDetails.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'No active subscription found'
+            });
+        }
+
+        const subscription = subscriptionDetails[0];
+        logger.info('Current Subscription:', { subscription });
+
+        // Get count of messages sent in current subscription period
+        const [messageCount] = await connection.query(
+            'SELECT COUNT(*) as count FROM media_messages ' +
+            'WHERE instance_id = ? ' +
+            'AND created_at >= ? ' +
+            'AND created_at <= COALESCE(?, NOW()) ' +  // Only count messages within subscription period
+            'AND created_at >= (SELECT created_at FROM subscription ' +  // Only count messages after this subscription was created
+            '                  WHERE instance_id = ? ' +
+            '                  AND id = ?)',
+            [instanceId, subscription.date_purchased, subscription.date_expiry, instanceId, subscription.id]
+        );
+
+        const totalMessagesSent = messageCount[0].count;
+        const messagesRemaining = subscription.num_messages - totalMessagesSent;
+
+        logger.info('Message Stats:', {
+            totalMessages: subscription.num_messages,
+            totalSent: totalMessagesSent,
+            remaining: messagesRemaining,
+            subscriptionId: subscription.id,
+            datePurchased: subscription.date_purchased,
+            dateExpiry: subscription.date_expiry,
+            createdAt: subscription.created_at
+        });
+
+        if (messagesRemaining <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Message limit reached. Please recharge your subscription.'
+            });
+        }
+
+        // Check if total numbers to send exceeds remaining messages
+        if (numbers.length > messagesRemaining) {
+            return res.status(400).json({
+                success: false,
+                message: `Can only send ${messagesRemaining} more messages with current subscription`
+            });
+        }
+
+        if (!sock) {
+            return res.status(400).json({ 
+                success: false,
+                message: 'WhatsApp instance not connected' 
+            });
+        }
+
+        let mediaPayload = null;
+        let fileExtension = null;
+
+        // Process media file if provided
+        if (filePath) {
+            try {
+                // Check if file exists
+                if (!fs.existsSync(filePath)) {
+                    return res.status(400).json({ 
+                        success: false,
+                        message: 'File not found' 
+                    });
+                }
+
+                // Check file size (16MB limit)
+                const stats = fs.statSync(filePath);
+                const fileSizeInMB = stats.size / (1024 * 1024);
+                if (fileSizeInMB > 16) {
+                    return res.status(400).json({ 
+                        success: false,
+                        message: 'File size exceeds 16MB limit' 
+                    });
+                }
+
+                fileExtension = path.extname(filePath).toLowerCase();
+                const fileBuffer = await fs.promises.readFile(filePath);
+                const mimeTypes = {
+                    '.jpg': 'image/jpeg',
+                    '.jpeg': 'image/jpeg',
+                    '.png': 'image/png',
+                    '.mp4': 'video/mp4',
+                    '.mov': 'video/quicktime',
+                    '.mp3': 'audio/mpeg',
+                    '.wav': 'audio/wav',
+                    '.ogg': 'audio/ogg',
+                    '.pdf': 'application/pdf',
+                    '.doc': 'application/msword',
+                    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                };
+
+                switch (fileExtension) {
+                    case '.jpg':
+                    case '.jpeg':
+                    case '.png':
+                        mediaPayload = {
+                            image: fileBuffer,
+                            caption: caption || '',
+                            mimetype: mimeTypes[fileExtension]
+                        };
+                        break;
+                    case '.mp4':
+                    case '.mov':
+                        mediaPayload = {
+                            video: fileBuffer,
+                            caption: caption || '',
+                            mimetype: mimeTypes[fileExtension]
+                        };
+                        break;
+                    case '.mp3':
+                    case '.wav':
+                    case '.ogg':
+                        mediaPayload = {
+                            audio: fileBuffer,
+                            mimetype: mimeTypes[fileExtension],
+                            ptt: fileExtension === '.ogg',
+                            caption: caption || ''
+                        };
+                        break;
+                    case '.pdf':
+                    case '.doc':
+                    case '.docx':
+                        mediaPayload = {
+                            document: fileBuffer,
+                            mimetype: mimeTypes[fileExtension],
+                            fileName: path.basename(filePath),
+                            caption: caption || ''
+                        };
+                        break;
+                    default:
+                        // For Excel and other files, send as document with auto-detected mimetype
+                        mediaPayload = {
+                            document: fileBuffer,
+                            fileName: path.basename(filePath),
+                            caption: caption || '',
+                            mimetype: 'application/octet-stream'  // Generic binary file type
+                        };
+                }
+
+                // Log the media payload for debugging
+                logger.info('Media payload created:', {
+                    type: fileExtension,
+                    fileName: path.basename(filePath),
+                    size: fileBuffer.length,
+                    mimeType: mediaPayload.mimetype || 'application/octet-stream'
+                });
+            } catch (error) {
+                logger.error('Media processing error:', { error: error.message });
+                return res.status(400).json({ 
+                    success: false,
+                    message: error.message || 'Invalid or missing media file' 
+                });
+            }
+        }
+
+        // Format phone numbers
+        const phoneNumbers = numbers.map(num => {
+            const cleanNum = num.trim().replace(/\D/g, '');
+            // Add '91' prefix if not present and number is 10 digits
+            return cleanNum.length === 10 ? '91' + cleanNum : cleanNum;
+        });
+
+        // Send messages with random delays and logging
+        const totalSent = await sendMessagesOneAtATime(
+            phoneNumbers,
+            mediaPayload,
+            message,
+            sock,
+            instanceId,
+            filePath,
+            caption,
+            scheduleTime
+        );
+
+        // Return success response
+        res.json({
+            success: true,
+            message: `Successfully processed ${totalSent} messages`,
+            totalMessages: totalSent
+        });
+
+    } catch (error) {
+        logger.error('Error in sendMedia:', { error: error.message, stack: error.stack });
+        
+        // Log the error message to database
+        try {
+            if (numbers && instanceId) {
+                await logMediaMessageToDB(
+                    instanceId,
+                    numbers,
+                    message,
+                    filePath,
+                    caption,
+                    scheduleTime,
+                    'failed'
+                );
+            }
+        } catch (dbError) {
+            logger.error('Error logging to database:', { error: dbError.message, stack: dbError.stack });
+        }
+
+        res.status(500).json({
+            success: false,
+            message: 'Failed to send messages',
+            error: error.message
+        });
+    }
+};

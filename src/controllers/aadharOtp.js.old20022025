@@ -1,0 +1,250 @@
+// src/controllers/aadharOtp.js
+
+import { logger } from '../logger.js';
+import axios from 'axios';
+import mysql from 'mysql2/promise';
+import { DB_NAME } from '../constants.js';
+
+const SUREPASS_API_URL = process.env.SUREPASS_API_URL;
+const SUREPASS_TOKEN = process.env.SUREPASS_TOKEN;
+
+// Store client_id and user data for verification
+const otpStorage = new Map();
+
+// Create a single connection pool
+const pool = mysql.createPool({
+    host: process.env.MYSQL_HOST,
+    user: process.env.MYSQL_USER,
+    password: process.env.MYSQL_PASSWORD,
+    database: DB_NAME,
+    port: process.env.MYSQL_PORT,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// Send OTP to Aadhar-linked mobile number using Surepass API
+export const sendAadharOTP = async (req, res) => {
+    try {
+        const { aadharNumber } = req.body;
+        logger.info(`Received OTP request for Aadhar: ${aadharNumber}`);
+
+        // Validate Aadhar number
+        if (!aadharNumber || !/^\d{12}$/.test(aadharNumber)) {
+            logger.warn(`Invalid Aadhar number format: ${aadharNumber}`);
+            return res.status(400).json({ 
+                success: false,
+                message: 'Invalid Aadhar number format. Must be 12 digits.' 
+            });
+        }
+
+        logger.info(`Calling Surepass API for OTP generation: ${aadharNumber}`);
+        
+        // Call Surepass API to generate OTP
+        const response = await axios.post(
+            `${process.env.SUREPASS_API_URL}/generate-otp`,
+            { 
+                id_number: aadharNumber,
+                // Add required parameters for v2 API
+                consent: "Y",
+                purpose: "User verification"
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.SUREPASS_TOKEN}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                }
+            }
+        );
+
+        if (!response.data?.success) {
+            logger.error('Surepass API error:', response.data);
+            throw new Error(response.data.message || 'Failed to generate OTP');
+        }
+
+        // Store OTP data with timestamp
+        otpStorage.set(aadharNumber, {
+            client_id: response.data.data.client_id,
+            timestamp: Date.now()
+        });
+
+        logger.info(`OTP sent successfully for Aadhar: ${aadharNumber}`);
+        res.status(200).json({
+            success: true,
+            message: 'OTP sent successfully',
+            client_id: response.data.data.client_id
+        });
+
+    } catch (error) {
+        logger.error('Error in sendAadharOTP:', {
+            error: error.message,
+            response: error.response?.data,
+            status: error.response?.status
+        });
+        
+        const errorMessage = error.response?.data?.message || 
+                           error.response?.data?.error || 
+                           error.message || 
+                           'Failed to send OTP';
+                           
+        res.status(error.response?.status || 500).json({ 
+            success: false,
+            message: errorMessage,
+            error: error.response?.data || error.message
+        });
+    }
+};
+
+// Update verification status in register table
+const updateVerificationStatus = async (email) => {
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        
+        // Update verified status in register table
+        const [updateResult] = await connection.execute(
+            `UPDATE register SET verified = 'yes' WHERE email = ?`,
+            [email]
+        );
+
+        if (updateResult.affectedRows === 0) {
+            logger.warn(`No user found with email: ${email}`);
+            throw new Error('User not found');
+        }
+
+        logger.info(`Verification status updated for user: ${email}`);
+        return true;
+    } catch (error) {
+        logger.error('Error in updateVerificationStatus:', {
+            error: error.message,
+            email: email
+        });
+        throw {
+            status: error.message === 'User not found' ? 404 : 500,
+            message: error.message === 'User not found' ? 
+                'User not found in database' : 
+                'Failed to update verification status'
+        };
+    } finally {
+        if (connection) {
+            connection.release();
+        }
+    }
+};
+
+// Verify OTP and match name using Surepass API
+export const verifyAadharOTP = async (req, res) => {
+    try {
+        const { aadharNumber, otp, username } = req.body;
+        logger.info(`Verifying OTP for Aadhar: ${aadharNumber}`);
+
+        // Validate inputs
+        if (!aadharNumber || !otp) {
+            return res.status(400).json({
+                success: false,
+                message: 'Aadhar number and OTP are required'
+            });
+        }
+
+        // Get stored client_id
+        const storedData = otpStorage.get(aadharNumber);
+        if (!storedData || !storedData.client_id) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please generate OTP first'
+            });
+        }
+
+        // Call Surepass API to verify OTP
+        const response = await axios.post(
+            `${process.env.SUREPASS_API_URL}/submit-otp`,
+            {
+                id_number: aadharNumber,
+                otp: otp,
+                client_id: storedData.client_id,
+                consent: "Y",
+                purpose: "User verification"
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.SUREPASS_TOKEN}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                }
+            }
+        );
+
+        if (!response.data?.success) {
+            logger.error('OTP verification failed:', response.data);
+            throw new Error(response.data.message || 'OTP verification failed');
+        }
+
+        // Clear OTP data after successful verification
+        otpStorage.delete(aadharNumber);
+
+        // Get Aadhar name from response
+        const aadharName = response.data.data?.name || '';
+        
+        // Check for name mismatch but don't block verification
+        const nameMismatch = username && aadharName.toLowerCase() !== username.toLowerCase();
+        
+        logger.info(`OTP verified successfully for Aadhar: ${aadharNumber}`);
+        
+        try {
+            // Get database connection from pool
+            const connection = await pool.getConnection();
+            
+            try {
+                // Update user's verification status to 'yes'
+                await connection.query(
+                    'UPDATE register SET verified = ? WHERE card_detail = ?',
+                    ['yes', aadharNumber]
+                );
+
+                connection.release();
+                
+                res.status(200).json({
+                    success: true,
+                    message: nameMismatch 
+                        ? 'OTP verified successfully. Note: The name provided does not match the name on the Aadhaar card.'
+                        : 'OTP verified successfully',
+                    nameMismatch,
+                    data: {
+                        verified: true,
+                        aadharName
+                    }
+                });
+            } catch (dbError) {
+                connection.release();
+                logger.error('Database error after successful OTP verification:', dbError);
+                throw dbError;
+            }
+        } catch (dbError) {
+            logger.error('Database error after successful OTP verification:', dbError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to update verification status',
+                verified: true, // OTP was verified but DB update failed
+                nameMismatch
+            });
+        }
+    } catch (error) {
+        logger.error('Error in verifyAadharOTP:', {
+            error: error.message,
+            response: error.response?.data,
+            status: error.response?.status
+        });
+
+        const errorMessage = error.response?.data?.message || 
+                           error.response?.data?.error || 
+                           error.message || 
+                           'OTP verification failed';
+
+        res.status(error.response?.status || 500).json({
+            success: false,
+            message: errorMessage,
+            error: error.response?.data || error.message
+        });
+    }
+};

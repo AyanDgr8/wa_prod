@@ -1,0 +1,564 @@
+// src/controllers/sign.js
+
+import bcrypt from 'bcrypt'; 
+import connectDB from '../db/index.js';  
+import jwt from 'jsonwebtoken'; 
+import dotenv from "dotenv";
+import nodemailer from 'nodemailer';
+import crypto from 'crypto';
+import { logger } from '../logger.js';
+
+dotenv.config();  // Load environment variables
+
+// Create nodemailer transporter
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASSWORD
+    }
+});
+
+// Register User (without role)
+export const registerCustomer = async (req, res) => {
+    const { username, telephone, email, password, address, card_select, card_detail, company_name, company_gst } = req.body; 
+
+    // Validate required fields
+    if (!username || !telephone || !email || !password || !address || !card_select || !card_detail) {
+        logger.warn(`Registration failed: Missing required fields for email: ${email}`);
+        return res.status(400).json({ 
+            success: false,
+            message: 'All required fields must be provided (username, telephone, email, password, address, card_select, card_detail)' 
+        });
+    }
+
+    try {
+        const connection = await connectDB();
+        
+        // Check if user exists
+        const [existingUser] = await connection.query(
+            'SELECT * FROM register WHERE email = ?',
+            [email]
+        );
+
+        if (existingUser.length === 0) {
+            logger.warn(`Registration failed: User not found for email: ${email}`);
+            return res.status(404).json({ 
+                success: false,
+                message: 'Registration not found. Please complete the payment process first.' 
+            });
+        }
+
+        // Hash the password
+        const hashedPassword = await bcrypt.hash(password, 10);
+    
+        // Update the existing user in the 'register' table with all fields
+        const [result] = await connection.query(
+            `UPDATE register 
+             SET password = ?, 
+                 card_select = ?, 
+                 card_detail = ?,
+                 address = ?,
+                 company_name = ?,
+                 company_gst = ?,
+                 username = ?,
+                 telephone = ?
+             WHERE email = ?`,
+            [hashedPassword, card_select, card_detail, address, company_name || null, company_gst || null, username, telephone, email]
+        );
+
+        if (result.affectedRows === 0) {
+            logger.error(`Registration update failed for email: ${email}`);
+            return res.status(500).json({ 
+                success: false,
+                message: 'Failed to update registration information' 
+            });
+        }
+
+        logger.info(`Registration completed successfully for email: ${email}`);
+        res.status(200).json({ 
+            success: true,
+            message: 'Registration completed successfully' 
+        });
+    } catch (error) {
+        logger.error(`Registration error for email ${email}: ${error.message}`);
+        res.status(500).json({ 
+            success: false,
+            message: 'Error saving registration information',
+            error: error.message 
+        });
+    }
+};
+
+// Login User
+export const loginCustomer = async (req, res) => {
+    const { email, password } = req.body; 
+
+    try {
+        const connection = await connectDB();
+
+        // Check if the user exists
+        const [user] = await connection.query('SELECT * FROM register WHERE email = ?', [email]);
+        if (user.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        // Validate password
+        const isValidPassword = await bcrypt.compare(password, user[0].password);
+        if (!isValidPassword) {
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
+
+        // Log the login time in 'login_history' table
+        await connection.query('INSERT INTO login_history (user_id, login_time) VALUES (?, NOW())', [user[0].id]);
+
+        // Generate JWT
+        const token = jwt.sign(
+            { 
+                userId: user[0].id, 
+                username: user[0].username, 
+                email: user[0].email,  
+                role: user[0].Role 
+            },
+            process.env.JWT_SECRET,
+            // { expiresIn: '20h' }
+        );
+
+        // Send success response with token, username, and email
+        res.status(200).json({ 
+            token,
+            role: user[0].Role,
+            username: user[0].username,
+            email: user[0].email  
+        }); 
+    } catch (error) {
+        console.error('Error during login:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
+// Logout User
+export const logoutCustomer = async (req, res) => {
+    const userId = req.user.userId;  // Assuming you have middleware that attaches user info to req
+
+    try {
+        const connection = await connectDB();
+
+        // Update the logout_time for the user's latest login record
+        await connection.query(
+            'UPDATE login_history SET logout_time = NOW() WHERE user_id = ? AND logout_time IS NULL',
+            [userId]
+        );
+
+        res.status(200).json({ message: 'User logged out successfully' });
+    } catch (error) {
+        console.error('Error during logout:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
+
+// Fetch Current User
+export const fetchCurrentUser = async (req, res) => {
+    const userId = req.user.userId;  // Assuming you have middleware that attaches user info to req
+
+    try {
+        const connection = await connectDB();
+
+        // Retrieve the user's information based on their ID
+        const [user] = await connection.query('SELECT id, username, email, role FROM users WHERE id = ?', [userId]);
+        
+        if (user.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        // Send success response with user information
+        res.status(200).json(user[0]);
+    } catch (error) {
+        console.error('Error fetching current user:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
+
+// Forgot Password
+export const forgotPassword = async (req, res) => {
+    const { email } = req.body;
+
+    try {
+        const connection = await connectDB();
+
+        // Check if user exists
+        const [users] = await connection.query('SELECT id, email, username FROM register WHERE email = ?', [email]);
+        if (users.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        const user = users[0];
+        
+        // Generate a temporary token (this won't be stored in DB)
+        const tempToken = crypto.createHash('sha256')
+            .update(user.id + user.email + Date.now().toString())
+            .digest('hex');
+
+        // Create reset URL
+        const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:4000'}/reset-password/${tempToken}`;
+
+        // Send email
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: 'Password Reset Request',
+            html: `
+                <h1>Password Reset Request</h1>
+                <p>Hello ${user.username},</p>
+                <p>You requested a password reset. Click the link below to reset your password:</p>
+                <a href="${resetUrl}" style="
+                    background-color: #EF6F53;
+                    color: white;
+                    padding: 10px 20px;
+                    text-decoration: none;
+                    border-radius: 5px;
+                    display: inline-block;
+                    margin: 20px 0;
+                ">Reset Password</a>
+                <p>This link will expire in 1 hour.</p>
+                <p>If you didn't request this, please ignore this email.</p>
+            `
+        };
+
+        await transporter.sendMail(mailOptions);
+        res.status(200).json({ message: 'Password reset link has been sent to your email' });
+
+    } catch (error) {
+        console.error('Error in forgot password:', error);
+        res.status(500).json({ message: 'Failed to send reset email' });
+    }
+};
+
+// Send OTP (Reset Password Link)
+export const sendOTP = async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        const connection = await connectDB();
+        
+        // Check if the user exists
+        const [users] = await connection.query('SELECT * FROM register WHERE email = ?', [email]);
+        
+        if (users.length === 0) {
+            return res.status(400).json({ 
+                message: 'The email address you entered is not associated with an account.' 
+            });
+        }
+
+        const user = users[0];
+
+        // Generate token with user ID
+        const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: "20m" });
+        const resetLink = `${process.env.FRONTEND_URL}/reset-password/${user.id}/${token}`;
+
+        // Mail options
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: 'Password Reset Request - MultyComm',
+            html: `
+                <h2>Password Reset Request</h2>
+                <p>Dear ${user.username},</p>
+                <p>We received a request to reset your password. Here are your account details:</p>
+                <ul>
+                    <li>Username: ${user.username}</li>
+                    <li>Email: ${email}</li>
+                </ul>
+                <p>Click the link below to reset your password:</p>
+                <a href="${resetLink}" style="display: inline-block; padding: 10px 20px; background-color: #EF6F53; color: white; text-decoration: none; border-radius: 5px;">Reset Password</a>
+               
+                <p>If you didn't request this password reset, please ignore this email or contact support if you have concerns.</p>
+                <p>Best regards,<br>Multycomm Team</p>
+            `
+        };
+
+        // Send mail using Promise
+        await transporter.sendMail(mailOptions);
+        return res.status(200).json({ 
+            message: 'Password reset link has been sent to your email. Please check your inbox.' 
+        });
+
+    } catch (error) {
+        console.error('Error sending link:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+};
+// Reset Password with Token
+export const resetPasswordWithToken = async (req, res) => {
+    try {
+        const { id, token } = req.params;
+        const { newPassword } = req.body;
+
+        // Password validation
+        if (!newPassword || newPassword.length < 8) {
+            return res.status(400).json({ message: 'Password must be at least 8 characters long' });
+        }
+
+        // Check for at least one uppercase letter
+        if (!/[A-Z]/.test(newPassword)) {
+            return res.status(400).json({ message: 'Password must contain at least one uppercase letter' });
+        }
+
+        // Check for at least one lowercase letter
+        if (!/[a-z]/.test(newPassword)) {
+            return res.status(400).json({ message: 'Password must contain at least one lowercase letter' });
+        }
+
+        // Check for at least one number
+        if (!/\d/.test(newPassword)) {
+            return res.status(400).json({ message: 'Password must contain at least one number' });
+        }
+
+        // Verify token
+        jwt.verify(token, process.env.JWT_SECRET, async (err, decoded) => {
+            if (err) {
+                return res.status(400).json({ message: "Invalid or expired token" });
+            }
+
+            // Verify that the token was generated for this user
+            if (decoded.userId !== parseInt(id)) {
+                return res.status(400).json({ message: "Invalid token for this user" });
+            }
+
+            try {
+                const connection = await connectDB();
+                
+                // Hash the new password
+                const hashedPassword = await bcrypt.hash(newPassword, 10);
+                
+                // Update password only - updated_at will be automatically updated
+                await connection.query(
+                    'UPDATE register SET password = ? WHERE id = ?',
+                    [hashedPassword, id]
+                );
+
+                res.status(200).json({ message: 'Password reset successful' });
+            } catch (error) {
+                console.error('Error updating password:', error);
+                res.status(500).json({ message: 'Failed to update password' });
+            }
+        });
+    } catch (error) {
+        console.error('Error resetting password:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+};
+
+// Reset Password
+export const resetPassword = async (req, res) => {
+    const { email, newPassword } = req.body;
+
+    try {
+        const connection = await connectDB();
+
+        // Find user by email
+        const [users] = await connection.query('SELECT * FROM register WHERE email = ?', [email]);
+        if (users.length === 0) {
+            return res.status(400).json({ message: 'User not found' });
+        }
+
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+        // Update password
+        await connection.query(
+            'UPDATE register SET password = ? WHERE email = ?',
+            [hashedPassword, email]
+        );
+
+        res.status(200).json({ message: 'Password reset successful' });
+
+    } catch (error) {
+        console.error('Error in reset password:', error);
+        res.status(500).json({ message: 'Failed to reset password' });
+    }
+};
+
+// Save Password
+export const savePassword = async (req, res) => {
+    try {
+        const { email, password, username, telephone, address, card_select, card_detail, company_name, company_gst } = req.body;
+
+        // Validate all required fields
+        if (!email || !password || !username || !telephone || !address) {
+            return res.status(400).json({
+                success: false,
+                message: 'All required fields must be provided: email, password, username, telephone, and address'
+            });
+        }
+
+        // Set default values for card_select and card_detail if not provided
+        const finalCardSelect = card_select || 'Aadhaar';
+        const finalCardDetail = card_detail || '';
+
+        const connection = await connectDB();
+        
+        try {
+            // First check if user exists
+            const [existingUser] = await connection.query(
+                'SELECT * FROM register WHERE email = ?',
+                [email]
+            );
+
+            // Hash the password
+            const hashedPassword = await bcrypt.hash(password, 10);
+
+            if (existingUser.length > 0) {
+                // Update existing user
+                await connection.query(
+                    `UPDATE register SET 
+                        password = ?,
+                        username = ?,
+                        telephone = ?,
+                        address = ?,
+                        card_select = ?,
+                        card_detail = ?,
+                        company_name = ?,
+                        company_gst = ?
+                    WHERE email = ?`,
+                    [
+                        hashedPassword,
+                        username,
+                        telephone,
+                        address,
+                        finalCardSelect,
+                        finalCardDetail,
+                        company_name || null,
+                        company_gst || null,
+                        email
+                    ]
+                );
+            } else {
+                // Insert new user
+                await connection.query(
+                    `INSERT INTO register (
+                        email, password, username, telephone, address, 
+                        card_select, card_detail, company_name, company_gst
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        email,
+                        hashedPassword,
+                        username,
+                        telephone,
+                        address,
+                        finalCardSelect,
+                        finalCardDetail,
+                        company_name || null,
+                        company_gst || null
+                    ]
+                );
+            }
+
+            // Log the values being saved for debugging
+            logger.info('Saving user details:', {
+                email,
+                username,
+                telephone,
+                address,
+                card_select: finalCardSelect,
+                card_detail: finalCardDetail
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: 'Password and user details saved successfully'
+            });
+        } catch (dbError) {
+            logger.error('Database error while saving password:', {
+                error: dbError.message,
+                email: email,
+                card_select: finalCardSelect,
+                card_detail: finalCardDetail
+            });
+            throw dbError;
+        }
+    } catch (error) {
+        logger.error('Error saving password:', {
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to save password',
+            error: error.message
+        });
+    }
+};
+
+// Check if user is already registered
+export const checkRegistration = async (req, res) => {
+    const { phone } = req.params;
+    
+    try {
+        const connection = await connectDB();
+        
+        // Check if phone exists in register table and has a password set
+        const [rows] = await connection.query(
+            'SELECT id FROM register WHERE telephone = ? AND password IS NOT NULL AND password != ""',
+            [phone]
+        );
+
+        return res.status(200).json({
+            isRegistered: rows.length > 0
+        });
+
+    } catch (error) {
+        console.error('Error checking registration:', error);
+        res.status(500).json({ message: 'Error checking registration status' });
+    }
+};
+
+// Check if user is verified
+export const checkUserPassword = async (req, res) => {
+    const { email } = req.body;
+
+    if (!email) {
+        logger.warn('Check status failed: No email provided');
+        return res.status(400).json({
+            success: false,
+            message: 'Email is required'
+        });
+    }
+
+    try {
+        const connection = await connectDB();
+        
+        // Check if user exists and get verification status
+        const [user] = await connection.query(
+            'SELECT verified FROM register WHERE email = ?',
+            [email]
+        );
+
+        if (user.length === 0) {
+            return res.status(200).json({
+                success: false,
+                message: 'User not found',
+                verified: 'no'
+            });
+        }
+
+        const isVerified = user[0].verified === 'yes';
+        
+        logger.info(`Status check for ${email}: Verified: ${isVerified ? 'Yes' : 'No'}`);
+        
+        return res.status(200).json({
+            success: true,
+            verified: user[0].verified,
+            canResetPassword: isVerified  // Only depends on verification status now
+        });
+    } catch (error) {
+        logger.error('Error checking user status:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Internal server error while checking user status'
+        });
+    }
+};
